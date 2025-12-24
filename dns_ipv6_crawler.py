@@ -122,13 +122,36 @@ class DNSIPv6Crawler:
         return random.choice(proxies)
         
     async def init_browser(self):
-        """初始化浏览器"""
-        logger.info("正在启动浏览器...")
+        """初始化浏览器（无痕模式+随机指纹）"""
+        logger.info("正在启动浏览器（无痕模式）...")
         self.playwright = await async_playwright().start()
         
         # 配置代理
         launch_options = {"headless": self.headless}
-        context_options = {}
+        
+        # 无痕模式 + 随机指纹配置
+        import random
+        user_agents = [
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+        ]
+        
+        viewports = [
+            {"width": 1920, "height": 1080},
+            {"width": 1440, "height": 900},
+            {"width": 1536, "height": 864},
+            {"width": 1366, "height": 768},
+        ]
+        
+        context_options = {
+            "user_agent": random.choice(user_agents),
+            "viewport": random.choice(viewports),
+            "locale": random.choice(["zh-CN", "zh-TW", "en-US"]),
+            "timezone_id": random.choice(["Asia/Shanghai", "Asia/Hong_Kong", "Asia/Taipei"]),
+        }
         
         if self.use_proxy:
             if self.check_proxy_available():
@@ -139,9 +162,10 @@ class DNSIPv6Crawler:
                 self.use_proxy = False
         
         self.browser = await self.playwright.chromium.launch(**launch_options)
+        # 使用 new_context 创建无痕浏览上下文（Playwright默认就是无痕的）
         self.context = await self.browser.new_context(**context_options)
         self.page = await self.context.new_page()
-        logger.info("浏览器启动成功")
+        logger.info(f"浏览器启动成功，UA: {context_options['user_agent'][:50]}...")
         
     async def restart_browser_for_new_ip(self):
         """重启浏览器并切换代理节点"""
@@ -352,37 +376,46 @@ class DNSIPv6Crawler:
                 logger.debug(f"已点击开始测试按钮")
                 
                 # 等待Loading遮罩消失（等待DNS查询完成）
+                # 关键：必须等待进度条到100%或Loading消失
                 start_time = time.time()
                 max_wait = 120  # 最多等待120秒
                 last_ipv6_count = 0
                 stable_count = 0
-                loading_gone = False
                 
                 while time.time() - start_time < max_wait:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)  # 每3秒检查一次
                     elapsed = time.time() - start_time
                     
                     try:
                         # 获取页面内容
                         content = await self.page.content()
                         
-                        # 检查Loading是否还在（检查进度条或Loading文字）
-                        is_loading = 'Loading' in content or 'ant-spin-spinning' in content
+                        # 检查Loading是否还在
+                        # 1. 检查Loading文字
+                        # 2. 检查进度百分比（如果不是100%说明还在加载）
+                        has_loading_text = 'Loading' in content
+                        has_spinner = 'ant-spin-spinning' in content
                         
-                        # 检查进度是否完成（100%或进度条消失）
-                        if not is_loading or '100%' in content:
-                            loading_gone = True
+                        # 提取进度百分比
+                        import re
+                        progress_match = re.search(r'(\d+)%', content)
+                        progress = int(progress_match.group(1)) if progress_match else 100
                         
-                        # 如果还在Loading，继续等待
-                        if not loading_gone:
-                            logger.debug(f"[{domain}] 等待 {elapsed:.1f}s, DNS查询进行中...")
+                        is_loading = has_loading_text or has_spinner or (progress < 100)
+                        
+                        if is_loading:
+                            logger.info(f"[{domain}] 等待 {elapsed:.0f}s, DNS查询进行中... (进度: {progress}%)")
                             continue
                         
-                        # Loading完成后，提取IPv6地址
+                        # Loading完成后，再等待2秒确保数据渲染完成
+                        await asyncio.sleep(2)
+                        content = await self.page.content()
+                        
+                        # 提取IPv6地址
                         valid_ipv6 = self.extract_ipv6_addresses(content)
                         current_count = len(valid_ipv6)
                         
-                        logger.debug(f"[{domain}] 等待 {elapsed:.1f}s, 当前找到 {current_count} 个IPv6")
+                        logger.debug(f"[{domain}] Loading完成，找到 {current_count} 个IPv6")
                         
                         if current_count > 0:
                             if current_count == last_ipv6_count:
@@ -395,11 +428,16 @@ class DNSIPv6Crawler:
                             else:
                                 stable_count = 0
                                 last_ipv6_count = current_count
-                        
-                        # 检查是否显示无记录（Loading完成后才判断）
-                        if loading_gone and '0 个 IP' in content:
-                            logger.info(f"- [{domain}] 无IPv6记录")
-                            break
+                        else:
+                            # 没有IPv6，检查是否显示无记录
+                            if '0 个 IP' in content or '0个IP' in content:
+                                logger.info(f"- [{domain}] 无IPv6记录")
+                                break
+                            # 可能还在渲染，继续等待
+                            stable_count += 1
+                            if stable_count >= 3:
+                                logger.info(f"- [{domain}] 无IPv6记录（超时）")
+                                break
                             
                     except Exception as e:
                         logger.warning(f"[{domain}] 检查结果时出错: {e}")
@@ -532,8 +570,8 @@ class DNSIPv6Crawler:
                     logger.info(f"--- 进度: {idx}/{end_index} ({idx*100//end_index}%) | 成功: {success_count} | 无记录: {no_record_count} ---")
                     self.write_results_to_excel()
                 
-                # 添加短暂延迟
-                await asyncio.sleep(1)
+                # 添加请求间隔（避免被封）
+                await asyncio.sleep(3)  # 每个请求间隔3秒
                 
         except KeyboardInterrupt:
             logger.warning("用户中断，正在保存进度和结果...")
@@ -576,7 +614,7 @@ async def main():
         use_proxy=True,  # 使用代理
         proxy_host="127.0.0.1",
         proxy_port=7890,
-        requests_per_ip=10  # 每10个请求切换IP（暂时禁用自动切换）
+        requests_per_ip=20  # 每20个请求切换IP
     )
     
     # 运行爬虫

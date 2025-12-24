@@ -224,6 +224,35 @@ class DNSIPv6Crawler:
         wb.close()
         return domains
     
+    def get_already_resolved_domains(self) -> set:
+        """获取已经解析过的域名（Excel中已有IPv6数据的）"""
+        resolved = set()
+        output_path = self.excel_path.replace('.xlsx', '_with_ipv6.xlsx')
+        
+        # 检查输出文件是否存在
+        if not Path(output_path).exists():
+            return resolved
+        
+        try:
+            wb = openpyxl.load_workbook(output_path)
+            ws = wb.active
+            
+            # 找到IPv6列的位置（从第15列开始）
+            for row in ws.iter_rows(min_row=2):
+                domain = row[0].value
+                if domain:
+                    # 检查第15列及之后是否有数据
+                    for cell in row[14:]:  # 从第15列开始（索引14）
+                        if cell.value:
+                            resolved.add(domain.strip())
+                            break
+            wb.close()
+            logger.info(f"已找到 {len(resolved)} 个已解析的域名，将跳过这些域名")
+        except Exception as e:
+            logger.warning(f"读取已解析域名失败: {e}")
+        
+        return resolved
+    
     def save_progress(self, current_index: int, results: dict):
         """保存当前进度到文件"""
         progress_data = {
@@ -322,6 +351,40 @@ class DNSIPv6Crawler:
             pass
         return False
     
+    async def force_restart_browser(self):
+        """强制重启浏览器（用于卡住时恢复）"""
+        logger.warning("强制重启浏览器...")
+        try:
+            await self.context.close()
+            await self.browser.close()
+        except:
+            pass
+        
+        await asyncio.sleep(2)
+        
+        # 重新初始化
+        import random
+        user_agents = [
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
+        viewports = [{"width": 1920, "height": 1080}, {"width": 1440, "height": 900}]
+        
+        context_options = {
+            "user_agent": random.choice(user_agents),
+            "viewport": random.choice(viewports),
+        }
+        
+        if self.use_proxy and self.check_proxy_available():
+            context_options["proxy"] = {"server": self.proxy_url}
+        
+        self.browser = await self.playwright.chromium.launch(headless=self.headless)
+        self.context = await self.browser.new_context(**context_options)
+        self.page = await self.context.new_page()
+        self.page_initialized = False
+        
+        logger.info("浏览器已重启")
+    
     async def query_ipv6(self, domain: str, max_retries: int = 3) -> list:
         """查询单个域名的IPv6地址（优化版：直接修改输入框，不重新加载页面）"""
         ipv6_list = []
@@ -373,14 +436,18 @@ class DNSIPv6Crawler:
                 
                 # 点击开始测试
                 await self.page.get_by_role('button', name='开始测试').click(force=True)
-                logger.debug(f"已点击开始测试按钮")
+                logger.info(f"[{domain}] 已点击开始测试，等待结果...")
                 
-                # 等待Loading遮罩消失（等待DNS查询完成）
-                # 关键：必须等待进度条到100%或Loading消失
+                # 等待DNS查询完成
+                # 核心逻辑：等待页面上出现当前域名的查询结果
                 start_time = time.time()
-                max_wait = 120  # 最多等待120秒
+                max_wait = 60  # 最多等待60秒（超时则重启浏览器）
                 last_ipv6_count = 0
                 stable_count = 0
+                found_result = False
+                
+                # 先等待5秒让查询开始
+                await asyncio.sleep(5)
                 
                 while time.time() - start_time < max_wait:
                     await asyncio.sleep(3)  # 每3秒检查一次
@@ -390,57 +457,61 @@ class DNSIPv6Crawler:
                         # 获取页面内容
                         content = await self.page.content()
                         
-                        # 检查Loading是否还在
-                        # 1. 检查Loading文字
-                        # 2. 检查进度百分比（如果不是100%说明还在加载）
-                        has_loading_text = 'Loading' in content
-                        has_spinner = 'ant-spin-spinning' in content
-                        
-                        # 提取进度百分比
-                        import re
-                        progress_match = re.search(r'(\d+)%', content)
-                        progress = int(progress_match.group(1)) if progress_match else 100
-                        
-                        is_loading = has_loading_text or has_spinner or (progress < 100)
-                        
-                        if is_loading:
-                            logger.info(f"[{domain}] 等待 {elapsed:.0f}s, DNS查询进行中... (进度: {progress}%)")
+                        # 检查当前域名是否在输入框中（确保是当前查询）
+                        if domain not in content:
+                            logger.warning(f"[{domain}] 页面内容不包含当前域名，可能查询未开始")
                             continue
                         
-                        # Loading完成后，再等待2秒确保数据渲染完成
-                        await asyncio.sleep(2)
-                        content = await self.page.content()
+                        # 检查是否有进度百分比显示（表示正在查询）
+                        import re
+                        progress_match = re.search(r'>(\d+)%<', content)
+                        if progress_match:
+                            progress = int(progress_match.group(1))
+                            if progress < 100:
+                                logger.info(f"[{domain}] 等待 {elapsed:.0f}s, DNS查询进行中... (进度: {progress}%)")
+                                continue
+                        
+                        # 检查是否有Loading文字
+                        if 'Loading' in content:
+                            logger.info(f"[{domain}] 等待 {elapsed:.0f}s, DNS查询进行中...")
+                            continue
                         
                         # 提取IPv6地址
                         valid_ipv6 = self.extract_ipv6_addresses(content)
                         current_count = len(valid_ipv6)
                         
-                        logger.debug(f"[{domain}] Loading完成，找到 {current_count} 个IPv6")
+                        # 检查是否显示"0 个 IP"
+                        has_zero_ip = '0 个 IP' in content or '0个IP' in content or '>0<' in content
                         
                         if current_count > 0:
                             if current_count == last_ipv6_count:
                                 stable_count += 1
-                                # 如果连续2次检查结果稳定，认为加载完成
                                 if stable_count >= 2:
                                     ipv6_list = list(valid_ipv6)
                                     logger.info(f"✓ [{domain}] 找到 {len(ipv6_list)} 个IPv6: {', '.join(ipv6_list[:3])}{'...' if len(ipv6_list) > 3 else ''}")
+                                    found_result = True
                                     break
                             else:
                                 stable_count = 0
                                 last_ipv6_count = current_count
-                        else:
-                            # 没有IPv6，检查是否显示无记录
-                            if '0 个 IP' in content or '0个IP' in content:
-                                logger.info(f"- [{domain}] 无IPv6记录")
-                                break
-                            # 可能还在渲染，继续等待
+                        elif has_zero_ip:
+                            logger.info(f"- [{domain}] 无IPv6记录")
+                            found_result = True
+                            break
+                        elif elapsed > 30:
+                            # 超过30秒还没结果，可能是无记录
                             stable_count += 1
-                            if stable_count >= 3:
-                                logger.info(f"- [{domain}] 无IPv6记录（超时）")
+                            if stable_count >= 2:
+                                logger.info(f"- [{domain}] 无IPv6记录（等待超时）")
+                                found_result = True
                                 break
                             
                     except Exception as e:
                         logger.warning(f"[{domain}] 检查结果时出错: {e}")
+                
+                if not found_result:
+                    logger.warning(f"⚠ [{domain}] 查询超时（{max_wait}秒），强制重启浏览器")
+                    await self.force_restart_browser()
                 
                 # 如果循环结束但有结果，也返回
                 if not ipv6_list and last_ipv6_count > 0:
@@ -519,6 +590,9 @@ class DNSIPv6Crawler:
         total = len(domains)
         logger.info(f"共读取到 {total} 个域名")
         
+        # 获取已解析的域名（跳过这些）
+        already_resolved = self.get_already_resolved_domains()
+        
         # 尝试加载之前的进度
         if resume:
             saved_index, saved_results = self.load_progress()
@@ -544,6 +618,11 @@ class DNSIPv6Crawler:
         try:
             for idx, domain in enumerate(domains_to_process, start=start_index + 1):
                 current_idx = idx
+                
+                # 跳过已解析的域名
+                if domain in already_resolved:
+                    logger.info(f"[{idx}/{end_index}] 跳过已解析: {domain}")
+                    continue
                 
                 # 检查是否需要切换IP
                 if self.use_proxy and self.current_request_count >= self.requests_per_ip:

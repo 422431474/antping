@@ -58,6 +58,11 @@ class DNSIPv6Crawler:
         self.progress_file = excel_path.replace('.xlsx', '_progress.json')
         self.last_failed_index = None  # 记录失败时的索引
         
+        # Clash API配置（用于切换节点）
+        self.clash_api_url = "http://127.0.0.1:9090"
+        self.clash_secret = ""  # 如果有密码，填写这里
+        self.proxy_group = "🔰 节点选择"  # 代理组名称
+        
     def check_proxy_available(self) -> bool:
         """检查代理是否可用"""
         import socket
@@ -66,6 +71,55 @@ class DNSIPv6Crawler:
         result = sock.connect_ex((self.proxy_host, self.proxy_port))
         sock.close()
         return result == 0
+    
+    def get_clash_proxies(self) -> list:
+        """获取Clash可用的代理节点列表"""
+        import urllib.request
+        try:
+            url = f"{self.clash_api_url}/proxies/{urllib.parse.quote(self.proxy_group)}"
+            headers = {}
+            if self.clash_secret:
+                headers['Authorization'] = f'Bearer {self.clash_secret}'
+            
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                # 过滤掉非节点的选项
+                all_proxies = data.get('all', [])
+                valid_proxies = [p for p in all_proxies if not any(x in p for x in ['流量', '套餐', '重置', '直连', '自动', '故障'])]
+                return valid_proxies
+        except Exception as e:
+            logger.warning(f"获取Clash代理列表失败: {e}")
+            return []
+    
+    def switch_clash_proxy(self, proxy_name: str) -> bool:
+        """切换Clash代理节点"""
+        import urllib.request
+        import urllib.parse
+        try:
+            url = f"{self.clash_api_url}/proxies/{urllib.parse.quote(self.proxy_group)}"
+            headers = {'Content-Type': 'application/json'}
+            if self.clash_secret:
+                headers['Authorization'] = f'Bearer {self.clash_secret}'
+            
+            data = json.dumps({'name': proxy_name}).encode('utf-8')
+            req = urllib.request.Request(url, data=data, headers=headers, method='PUT')
+            with urllib.request.urlopen(req, timeout=5) as response:
+                logger.info(f"已切换到代理节点: {proxy_name}")
+                return True
+        except Exception as e:
+            logger.warning(f"切换Clash代理失败: {e}")
+            return False
+    
+    def get_next_proxy(self) -> str:
+        """获取下一个代理节点"""
+        proxies = self.get_clash_proxies()
+        if not proxies:
+            return None
+        
+        # 随机选择一个节点
+        import random
+        return random.choice(proxies)
         
     async def init_browser(self):
         """初始化浏览器"""
@@ -90,18 +144,26 @@ class DNSIPv6Crawler:
         logger.info("浏览器启动成功")
         
     async def restart_browser_for_new_ip(self):
-        """重启浏览器以获取新IP（通过代理软件的IP轮换）"""
+        """重启浏览器并切换代理节点"""
         logger.info("=" * 40)
-        logger.info(f"已处理 {self.requests_per_ip} 个请求，重启浏览器切换IP...")
+        logger.info(f"已处理 {self.requests_per_ip} 个请求，切换代理节点...")
         logger.info("=" * 40)
+        
+        # 尝试通过Clash API切换节点
+        next_proxy = self.get_next_proxy()
+        if next_proxy:
+            self.switch_clash_proxy(next_proxy)
+            await asyncio.sleep(2)  # 等待切换生效
+        else:
+            logger.warning("无法获取代理节点列表，将继续使用当前节点")
         
         # 关闭当前浏览器
         await self.context.close()
         await self.browser.close()
         
-        # 等待一段时间让代理软件切换IP
-        logger.info("等待5秒让代理切换IP...")
-        await asyncio.sleep(5)
+        # 等待一段时间
+        logger.info("等待3秒...")
+        await asyncio.sleep(3)
         
         # 重新初始化浏览器
         context_options = {}
@@ -248,11 +310,33 @@ class DNSIPv6Crawler:
                 
                 # 检查是否被封（24小时限制）
                 if await self.check_if_blocked():
-                    logger.error("=" * 60)
-                    logger.error("检测到IP被封禁（24小时限制），停止爬虫！")
-                    logger.error("请更换IP或等待24小时后再试")
-                    logger.error("=" * 60)
-                    raise Exception("IP_BLOCKED_24H")
+                    logger.warning("检测到IP被封禁，尝试切换代理节点...")
+                    
+                    # 尝试切换节点
+                    next_proxy = self.get_next_proxy()
+                    if next_proxy:
+                        self.switch_clash_proxy(next_proxy)
+                        await asyncio.sleep(3)
+                        
+                        # 重新加载页面
+                        self.page_initialized = False
+                        await self.init_page_for_aaaa()
+                        
+                        # 再次检查是否被封
+                        if await self.check_if_blocked():
+                            logger.error("=" * 60)
+                            logger.error("切换节点后仍被封禁，停止爬虫！")
+                            logger.error("请手动更换代理节点或等待24小时后再试")
+                            logger.error("=" * 60)
+                            raise Exception("IP_BLOCKED_24H")
+                        else:
+                            logger.info("切换节点成功，继续爬取...")
+                    else:
+                        logger.error("=" * 60)
+                        logger.error("检测到IP被封禁（24小时限制），且无法切换节点，停止爬虫！")
+                        logger.error("请手动更换代理节点或等待24小时后再试")
+                        logger.error("=" * 60)
+                        raise Exception("IP_BLOCKED_24H")
                 
                 logger.debug(f"开始查询域名: {domain}")
                 
